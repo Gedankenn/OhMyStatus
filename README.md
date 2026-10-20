@@ -1,8 +1,10 @@
 # OhMyStatus
 
-Omarchy bar widget for **this machine**: CPU, RAM, GPU, VRAM, disk and estimated watts. Click the chip for a popup with time line charts.
+Local stats on the [Omarchy](https://omarchy.org/) bar. Click the chip for time line charts of CPU, RAM, GPU, VRAM, disk and power.
 
-Not wall/PSU watts. GPU PPT is measured when the driver exports it; CPU watts fall back to TDP × utilization if RAPL is unreadable.
+<p align="center">
+  <img src="assets/screenshot.png" alt="OhMyStatus: bar chip and popup with line charts" width="420">
+</p>
 
 ## Install
 
@@ -10,7 +12,7 @@ Not wall/PSU watts. GPU PPT is measured when the driver exports it; CPU watts fa
 omarchy plugin add https://github.com/Gedankenn/OhMyStatus.git --enable
 ```
 
-Place it in the bar if it does not show up:
+If it does not appear on the bar:
 
 ```bash
 omarchy plugin enable ohmystatus --section center
@@ -18,9 +20,14 @@ omarchy plugin enable ohmystatus --section center
 
 ## Use
 
-- Left click: popup
-- Middle click: refresh now
-- History lives in `$XDG_RUNTIME_DIR/ohmystatus.<hostname>.hist.json` while the session is up. Reboot clears it.
+| Input | Action |
+| --- | --- |
+| Left click | Open popup |
+| Middle click | Refresh now |
+
+History is kept in `$XDG_RUNTIME_DIR/ohmystatus.<hostname>.hist.json` for the session. A reboot clears it.
+
+GPU watts come from the driver PPT sensor when it exists. CPU watts use RAPL if readable, otherwise TDP × utilization. Totals are not wall/PSU draw.
 
 ## License
 
