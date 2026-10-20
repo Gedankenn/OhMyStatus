@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "ohmystatus",
+  "name": "OhMyStatus",
+  "version": "1.0.0",
+  "author": "Gedankenn",
+  "license": "MIT",
+  "description": "Local CPU, RAM, GPU, disk and power on the Omarchy bar, with time line charts on click.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OhMyStatus",
+    "description": "Bar stats for this machine; click for line charts and watts",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "refreshSeconds": 5
+    },
+    "schema": [
+      {
+        "key": "refreshSeconds",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 3,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}
