@@ -49,8 +49,15 @@ Panel {
   readonly property var cpu: (snap && snap.cpu) ? snap.cpu : ({})
   readonly property var mem: (snap && snap.mem) ? snap.mem : ({})
   readonly property var gpu: (snap && snap.gpu) ? snap.gpu : ({})
+  readonly property var gpus: {
+    var list = (snap && snap.gpus) ? snap.gpus : []
+    if (list && typeof list.length === "number" && list.length > 0) return list
+    return (snap && snap.gpu) ? [snap.gpu] : []
+  }
   readonly property var disk: (snap && snap.disk) ? snap.disk : ({})
   readonly property var power: (snap && snap.power) ? snap.power : ({})
+  readonly property var bios: (snap && snap.bios) ? snap.bios : ({})
+  readonly property string boardName: (snap && snap.board) ? String(snap.board) : ""
   readonly property color statusColor: !reachable ? "#888888" : (stressed ? hot : lime)
   readonly property real powerPct: {
     var cap = Model.num(power.cap_w, 0)
@@ -58,12 +65,13 @@ Panel {
     return cap > 0 ? Math.min(100, (w / cap) * 100) : 0
   }
 
-  ListModel { id: cpuHist }
-  ListModel { id: memHist }
-  ListModel { id: gpuHist }
-  ListModel { id: vramHist }
-  ListModel { id: diskHist }
-  ListModel { id: pwrHist }
+  property real lastPollMs: 0
+  property var cpuHist: []
+  property var memHist: []
+  property var gpuHist: []
+  property var vramHist: []
+  property var diskHist: []
+  property var pwrHist: []
 
   function open() {
     openedFromHotkey = false
@@ -108,6 +116,8 @@ Panel {
 
   function refresh() {
     pollRetries = 0
+    if (pollProc.running) return
+    if (Date.now() - lastPollMs < 900) return
     startPoll()
   }
 
@@ -136,18 +146,14 @@ Panel {
     }
     root.snap = parsed
     root.pollRetries = 0
-    root.fillHist(cpuHist, parsed.hist ? parsed.hist.cpu : null)
-    root.fillHist(memHist, parsed.hist ? parsed.hist.mem : null)
-    root.fillHist(gpuHist, parsed.hist ? parsed.hist.gpu : null)
-    root.fillHist(vramHist, parsed.hist ? parsed.hist.vram : null)
-    root.fillHist(diskHist, parsed.hist ? parsed.hist.disk : null)
-    root.fillHist(pwrHist, parsed.hist ? parsed.hist.pwr : null)
-  }
-
-  function fillHist(model, arr) {
-    model.clear()
-    var pts = Model.histPoints(arr)
-    for (var i = 0; i < pts.length; i++) model.append(pts[i])
+    root.lastPollMs = Date.now()
+    var h = parsed.hist || {}
+    root.cpuHist = h.cpu || []
+    root.memHist = h.mem || []
+    root.gpuHist = h.gpu || []
+    root.vramHist = h.vram || []
+    root.diskHist = h.disk || []
+    root.pwrHist = h.pwr || []
   }
 
   function heatColor(pct, cool) {
@@ -322,11 +328,12 @@ Panel {
   component HistRow: Item {
     id: hrow
     property string name: ""
+    property string subname: ""
     property string value: ""
     property string extra: ""
     property color accent: root.lime
     property color extraColor: root.lime
-    property var points
+    property var values: []
     property real scaleMax: 100
     property real chartH: Style.space(44)
 
@@ -354,6 +361,21 @@ Panel {
           font.letterSpacing: 1.2
           font.weight: Font.DemiBold
           opacity: 0.9
+        }
+        Text {
+          id: hSub
+          anchors.left: hName.right
+          anchors.leftMargin: Style.space(8)
+          anchors.right: hValue.left
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          textFormat: Text.PlainText
+          text: hrow.subname
+          visible: text.length > 0
+          elide: Text.ElideRight
+          color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.5)
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.bodySmall
         }
         Text {
           id: hExtra
@@ -403,13 +425,8 @@ Panel {
           onVisibleChanged: if (visible) paintLine()
 
           Connections {
-            target: hrow.points
-            function onCountChanged() { plot.paintLine() }
-            function onDataChanged() { plot.paintLine() }
-          }
-
-          Connections {
             target: hrow
+            function onValuesChanged() { plot.paintLine() }
             function onScaleMaxChanged() { plot.paintLine() }
             function onAccentChanged() { plot.paintLine() }
           }
@@ -419,9 +436,9 @@ Panel {
             var w = width
             var h = height
             ctx.clearRect(0, 0, w, h)
-            var pts = hrow.points
-            if (!pts || pts.count < 1 || w < 2 || h < 2) return
-            var n = pts.count
+            var pts = hrow.values || []
+            var n = pts.length
+            if (!n || w < 2 || h < 2) return
             var cap = Math.max(hrow.scaleMax, 1)
             var c = hrow.accent
             var stroke = "rgb(" + Math.round(c.r * 255) + ", " + Math.round(c.g * 255) + ", " + Math.round(c.b * 255) + ")"
@@ -432,7 +449,7 @@ Panel {
             ctx.lineCap = "round"
             ctx.beginPath()
             for (var i = 0; i < n; i++) {
-              var v = Number(pts.get(i).v)
+              var v = Number(pts[i])
               if (!isFinite(v)) v = 0
               var x = n === 1 ? w * 0.5 : i * (w - 1) / (n - 1)
               var y = h - 1 - (h - 2) * Math.max(0, Math.min(1, v / cap))
@@ -456,7 +473,7 @@ Panel {
     focusTarget: keyCatcher
     padding: Style.spacing.md
     contentWidth: panel.fittedContentWidth(root.panelWidth)
-    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(560))
+    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(760))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -528,45 +545,61 @@ Panel {
 
             HistRow {
               name: "CPU"
+              subname: root.cpu.name || ""
               value: Model.pct(root.cpu.percent)
               extra: Model.tempWatts(root.cpu.temp, root.power.cpu_w, root.power.cpu_source !== "rapl")
-              points: cpuHist
+              values: root.cpuHist
               scaleMax: 100
               accent: root.heatColor(root.cpu.percent, root.cpuCool)
               extraColor: root.tempColor(root.cpu.temp)
             }
             HistRow {
               name: "RAM"
+              subname: Model.ramKind(root.mem)
               value: Model.pct(root.mem.percent)
-              extra: (root.mem.used_gb || 0) + "/" + (root.mem.total_gb || 0) + " G"
-              points: memHist
+              extra: Model.ramExtra(root.mem)
+              values: root.memHist
               scaleMax: 100
               accent: root.heatColor(root.mem.percent, root.ramCool)
               extraColor: root.heatColor(root.mem.percent, root.ramCool)
             }
-            HistRow {
-              name: "GPU"
-              value: Model.pct(root.gpu.percent)
-              extra: Model.tempWatts(root.gpu.temp, root.power.gpu_w, false)
-              points: gpuHist
-              scaleMax: 100
-              accent: root.heatColor(root.gpu.percent, root.gpuCool)
-              extraColor: root.tempColor(root.gpu.temp)
-            }
-            HistRow {
-              name: "VRAM"
-              value: Model.pct(root.gpu.vram_percent)
-              extra: (root.gpu.vram_used_mb || 0) + "/" + (root.gpu.vram_total_mb || 0) + " M"
-              points: vramHist
-              scaleMax: 100
-              accent: root.heatColor(root.gpu.vram_percent, root.vramCool)
-              extraColor: root.heatColor(root.gpu.vram_percent, root.vramCool)
+            Repeater {
+              model: root.gpus.length
+
+              delegate: Column {
+                id: gpuBlock
+                required property int index
+                width: contentColumn.width
+                spacing: Style.space(9)
+
+                readonly property var card: root.gpus[index] || ({})
+
+                HistRow {
+                  name: gpuBlock.index === 0 ? "GPU" : "GPU " + (gpuBlock.index + 1)
+                  subname: String(gpuBlock.card.name || "")
+                  value: Model.pct(gpuBlock.card.percent)
+                  extra: Model.tempWatts(gpuBlock.card.temp, gpuBlock.card.power_w, false)
+                  values: root.gpuHist.length > gpuBlock.index ? root.gpuHist[gpuBlock.index] : []
+                  scaleMax: 100
+                  accent: root.heatColor(gpuBlock.card.percent, root.gpuCool)
+                  extraColor: root.tempColor(gpuBlock.card.temp)
+                }
+                HistRow {
+                  name: "VRAM"
+                  value: Model.pct(gpuBlock.card.vram_percent)
+                  extra: (gpuBlock.card.vram_used_mb || 0) + "/" + (gpuBlock.card.vram_total_mb || 0) + " M"
+                  values: root.vramHist.length > gpuBlock.index ? root.vramHist[gpuBlock.index] : []
+                  scaleMax: 100
+                  accent: root.heatColor(gpuBlock.card.vram_percent, root.vramCool)
+                  extraColor: root.heatColor(gpuBlock.card.vram_percent, root.vramCool)
+                }
+              }
             }
             HistRow {
               name: "DISK"
               value: Model.pct(root.disk.percent)
               extra: Model.diskExtra(root.disk)
-              points: diskHist
+              values: root.diskHist
               scaleMax: 100
               accent: root.heatColor(root.disk.percent, root.diskCool)
               extraColor: root.heatColor(root.disk.percent, root.diskCool)
@@ -576,7 +609,7 @@ Panel {
               name: "POWER"
               value: Model.watts(root.power.watts)
               extra: ""
-              points: pwrHist
+              values: root.pwrHist
               scaleMax: Math.max(Model.num(root.power.cap_w, 0), 1)
               accent: root.heatColor(root.powerPct, root.powerCool)
               extraColor: root.powerCool
@@ -584,21 +617,51 @@ Panel {
             }
           }
 
-          Text {
+          Column {
             visible: root.reachable
             width: parent.width
-            textFormat: Text.PlainText
-            wrapMode: Text.WordWrap
-            text: {
-              var bits = []
-              if (root.cpu.name) bits.push(root.cpu.name)
-              if (root.cpu.cores) bits.push(root.cpu.cores + " th")
-              if (root.gpu.name) bits.push(root.gpu.name)
-              return bits.join("   ·   ")
+            spacing: Style.space(2)
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              visible: text.length > 0
+              text: root.boardName
+              color: Qt.rgba(root.lime.r, root.lime.g, root.lime.b, 0.55)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
             }
-            color: Qt.rgba(root.lime.r, root.lime.g, root.lime.b, 0.55)
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.bodySmall
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              visible: text.length > 0
+              text: Model.biosLine(root.bios)
+              color: Qt.rgba(root.lime.r, root.lime.g, root.lime.b, 0.45)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              visible: text.length > 0
+              text: Model.sysLine(root.snap)
+              color: Qt.rgba(root.lime.r, root.lime.g, root.lime.b, 0.45)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              visible: text.length > 0
+              text: Model.hwLine(root.cpu, root.mem)
+              color: Qt.rgba(root.lime.r, root.lime.g, root.lime.b, 0.45)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
           }
 
           Text {

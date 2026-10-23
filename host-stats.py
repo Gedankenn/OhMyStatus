@@ -10,6 +10,10 @@ import subprocess
 import sys
 import time
 
+DOCKER_TTL = 15.0
+COUNTERS_MIN_AGE = 0.5
+COUNTERS_MAX_AGE = 120.0
+
 
 def _read(path: str) -> str:
     try:
@@ -17,6 +21,96 @@ def _read(path: str) -> str:
             return fh.read().strip()
     except OSError:
         return ""
+
+
+def _runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+
+
+def _host_tag() -> str:
+    host = _read("/etc/hostname") or os.uname().nodename
+    return "".join(c if c.isalnum() or c in ".-" else "_" for c in host) or "host"
+
+
+def _boot_id() -> str:
+    return _read("/proc/sys/kernel/random/boot_id")
+
+
+def _cache_load(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_json(path: str, data: dict) -> None:
+    """Atomic write: never leaves a half-written file behind."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+_STATIC: dict | None = None
+
+
+def _hw_cache_path() -> str:
+    return os.path.join(_runtime_dir(), f"ohmystatus-{_host_tag()}.hwcache.json")
+
+
+def _static_cache() -> dict:
+    """Static hardware facts, valid until the next boot."""
+    global _STATIC
+    if _STATIC is None:
+        boot = _boot_id()
+        data = _cache_load(_hw_cache_path())
+        if not boot or data.get("boot") != boot:
+            data = {"boot": boot}
+        _STATIC = data
+    return _STATIC
+
+
+def _cached(key: str, fn):
+    data = _static_cache()
+    if key in data:
+        return data[key]
+    value = fn()
+    data[key] = value
+    _write_json(_hw_cache_path(), data)
+    return value
+
+
+def _counters_path() -> str:
+    return os.path.join(_runtime_dir(), f"ohmystatus-{_host_tag()}.counters.json")
+
+
+def _counters_load() -> dict | None:
+    data = _cache_load(_counters_path())
+    if not data or data.get("boot") != _boot_id():
+        return None
+    return data
+
+
+def _counters_save(idle: int, total: int, io: dict, energies: list, when: float) -> None:
+    _write_json(
+        _counters_path(),
+        {
+            "boot": _boot_id(),
+            "t": round(when, 3),
+            "idle": idle,
+            "total": total,
+            "io": {k: list(v) for k, v in io.items()},
+            "energies": energies,
+        },
+    )
 
 
 def _read_int(path: str) -> int | None:
@@ -70,6 +164,118 @@ def cpu_cores() -> int:
     return n
 
 
+_JUNK_DMI = {
+    "",
+    "default string",
+    "to be filled by o.e.m.",
+    "none",
+    "not specified",
+    "n/a",
+    "unknown",
+}
+_DDR_RATES = (
+    1600, 1866, 2133, 2400, 2666, 2800, 2933, 3000, 3200, 3466, 3600, 3800,
+    4000, 4266, 4400, 4800, 5200, 5600, 6000, 6400, 7200, 8000,
+)
+
+
+def _clean_dmi(s: str) -> str:
+    t = " ".join((s or "").split())
+    if t.lower() in _JUNK_DMI:
+        return ""
+    return t
+
+
+def board_name() -> str:
+    vendor = _clean_dmi(_read("/sys/class/dmi/id/board_vendor"))
+    name = _clean_dmi(_read("/sys/class/dmi/id/board_name"))
+    if vendor and name:
+        if name.lower().startswith(vendor.lower()):
+            return name
+        return f"{vendor} {name}"
+    return name or vendor or _clean_dmi(_read("/sys/class/dmi/id/product_name"))
+
+
+def _pci_short(slot: str) -> str:
+    parts = slot.split(":")
+    if len(parts) >= 3 and parts[0] == "0000":
+        return ":".join(parts[1:])
+    return slot
+
+
+def gpu_market_name(uevent: str) -> str:
+    slot = ""
+    for line in uevent.splitlines():
+        if line.startswith("PCI_SLOT_NAME="):
+            slot = line.split("=", 1)[-1].strip()
+    if not slot:
+        return ""
+    key = "gpu:" + slot
+    cached = _static_cache().get(key)
+    if isinstance(cached, str) and cached:
+        return cached
+    name = _gpu_market_lookup(slot)
+    if name:
+        _static_cache()[key] = name
+        _write_json(_hw_cache_path(), _static_cache())
+    return name
+
+
+def _gpu_market_lookup(slot: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["lspci", "-s", _pci_short(slot), "-nn"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    line = (proc.stdout or "").strip()
+    m = re.search(r"\[([^\[\]]+)\]\s*\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]", line)
+    if not m:
+        return ""
+    return m.group(1)[:56]
+
+
+def _rate_from_text(s: str) -> int | None:
+    found = [n for n in _DDR_RATES if re.search(rf"(?:^|\D){n}(?:\D|$)", s)]
+    return max(found) if found else None
+
+
+def ram_meta() -> tuple[str, int | None]:
+    kind = ""
+    rates: list[int] = []
+    for drv in ("ee1004", "at24", "eeprom"):
+        for path in glob.glob(f"/sys/bus/i2c/drivers/{drv}/*/eeprom"):
+            try:
+                with open(path, "rb") as fh:
+                    spd = fh.read(512)
+            except OSError:
+                continue
+            if len(spd) < 20:
+                continue
+            if spd[2] == 0x0C:
+                kind = kind or "DDR4"
+            elif spd[2] == 0x12:
+                kind = kind or "DDR5"
+            elif spd[2] == 0x0B:
+                kind = kind or "DDR3"
+            pn = ""
+            if len(spd) >= 349:
+                pn = bytes(spd[329:349]).decode("ascii", "replace")
+            r = _rate_from_text(pn)
+            if r:
+                rates.append(r)
+                continue
+            if spd[2] == 0x0C and spd[11]:
+                tck_ns = spd[18] * (spd[10] / spd[11])
+                if tck_ns > 0:
+                    mts = int(round(2000.0 / tck_ns))
+                    rates.append(min(_DDR_RATES, key=lambda x: abs(x - mts)))
+    return kind, (max(rates) if rates else None)
+
+
 def mem() -> dict:
     total = avail = 0
     for line in _read("/proc/meminfo").splitlines():
@@ -79,10 +285,13 @@ def mem() -> dict:
             avail = int(line.split()[1])
     used = max(0, total - avail)
     pct = (used / total * 100.0) if total else 0.0
+    kind, mt_s = _cached("ram", ram_meta)
     return {
         "percent": round(pct, 1),
         "used_gb": round(used / 1048576.0, 1),
         "total_gb": round(total / 1048576.0, 1),
+        "kind": kind,
+        "mt_s": mt_s,
     }
 
 
@@ -182,8 +391,14 @@ def disk(_path: str = "/") -> dict:
 
 
 def hwmon_by_name(name: str) -> str | None:
-    for base in glob.glob("/sys/class/hwmon/hwmon*"):
+    key = "hwmon:" + name
+    cached = _static_cache().get(key)
+    if isinstance(cached, str) and _read(os.path.join(cached, "name")) == name:
+        return cached
+    for base in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
         if _read(os.path.join(base, "name")) == name:
+            _static_cache()[key] = base
+            _write_json(_hw_cache_path(), _static_cache())
             return base
     return None
 
@@ -351,17 +566,7 @@ def _wake_gpu() -> list[int]:
     return fds
 
 
-def gpu() -> dict:
-    empty = {
-        "percent": 0,
-        "temp": None,
-        "name": "",
-        "vram_percent": 0,
-        "vram_used_mb": 0,
-        "vram_total_mb": 0,
-        "power_w": None,
-        "power_cap_w": None,
-    }
+def gpu_list() -> list[dict]:
     found: list[dict] = []
     fds = _wake_gpu()
     try:
@@ -381,6 +586,7 @@ def gpu() -> dict:
             for line in uevent.splitlines():
                 if line.startswith("DRIVER="):
                     label = line.split("=", 1)[-1]
+            pretty = gpu_market_name(uevent)
             hw = None
             for h in glob.glob(os.path.join(entry, "hwmon/hwmon*")):
                 hw = h
@@ -392,7 +598,7 @@ def gpu() -> dict:
                 {
                     "percent": int(max(0, min(100, busy))),
                     "temp": temp_c(hw),
-                    "name": label or "gpu",
+                    "name": pretty or label or "gpu",
                     "vram_percent": round(vram_pct, 1),
                     "vram_used_mb": int(used / 1048576) if used else 0,
                     "vram_total_mb": int(total / 1048576) if total else 0,
@@ -400,12 +606,47 @@ def gpu() -> dict:
                     "power_cap_w": gpu_cap,
                 }
             )
-        if not found:
-            return empty
-        return max(found, key=lambda g: g.get("vram_total_mb") or 0)
+        return found
     finally:
         for fd in fds:
             os.close(fd)
+
+
+def gpus() -> list[dict]:
+    """Every GPU exposed via DRM, biggest VRAM first."""
+    found = gpu_list()
+    return sorted(found, key=lambda g: g.get("vram_total_mb") or 0, reverse=True)
+
+
+def gpu() -> dict:
+    found = gpus()
+    if found:
+        return found[0]
+    return {
+        "percent": 0,
+        "temp": None,
+        "name": "",
+        "vram_percent": 0,
+        "vram_used_mb": 0,
+        "vram_total_mb": 0,
+        "power_w": None,
+        "power_cap_w": None,
+    }
+
+
+def bios_meta() -> dict:
+    return {
+        "version": _clean_dmi(_read("/sys/class/dmi/id/bios_version")),
+        "date": _clean_dmi(_read("/sys/class/dmi/id/bios_date")),
+    }
+
+
+def uptime_s() -> int:
+    raw = _read("/proc/uptime").split()
+    try:
+        return int(float(raw[0]))
+    except (IndexError, ValueError):
+        return 0
 
 
 _WEB_PORTS = {
@@ -448,7 +689,7 @@ def _docker_dot(state: str, health: str, status: str) -> str:
     return "off"
 
 
-def dockers() -> dict:
+def _dockers_probe() -> dict:
     empty = {"available": False, "items": []}
     try:
         proc = subprocess.run(
@@ -491,6 +732,19 @@ def dockers() -> dict:
     return {"available": True, "items": items[:32]}
 
 
+def dockers() -> dict:
+    """Docker state is not a 5 s signal; keep a short TTL cache."""
+    path = os.path.join(_runtime_dir(), f"ohmystatus-{_host_tag()}.docker.json")
+    cached = _cache_load(path)
+    age = time.time() - float(cached.get("t") or 0)
+    data = cached.get("data")
+    if isinstance(data, dict) and 0.0 <= age < DOCKER_TTL:
+        return data
+    data = _dockers_probe()
+    _write_json(path, {"t": round(time.time(), 3), "data": data})
+    return data
+
+
 def _cpu_power(sample_s: float = 0.12) -> dict:
     pkgs = rapl_packages()
     tdp_w = 0.0
@@ -500,41 +754,56 @@ def _cpu_power(sample_s: float = 0.12) -> dict:
     tdp = tdp_w if tdp_w > 0 else None
     if tdp is None:
         tdp = default_tdp()
-    energies = [rapl_energy_uj(p["path"]) for p in pkgs]
-    io0 = _diskstats()
-    t0 = time.perf_counter()
+
     idle1, total1 = cpu_times()
-    time.sleep(sample_s)
-    idle2, total2 = cpu_times()
     io1 = _diskstats()
-    wall = time.perf_counter() - t0
-    dt = total2 - total1
-    di = idle2 - idle1
-    cpu_pct_m = 0.0 if dt <= 0 else max(0.0, min(100.0, (1.0 - di / dt) * 100.0))
+    e1 = [rapl_energy_uj(p["path"]) for p in pkgs]
+    t1 = time.time()
+
+    prev = _counters_load()
+    wall = (t1 - float(prev.get("t") or 0)) if prev else -1.0
+    if not prev or wall < COUNTERS_MIN_AGE or wall > COUNTERS_MAX_AGE:
+        # Cold start or clock jump: take one short in-process sample.
+        time.sleep(sample_s)
+        idle0, total0, io0, e0 = idle1, total1, io1, e1
+        t0 = t1
+        idle1, total1 = cpu_times()
+        io1 = _diskstats()
+        e1 = [rapl_energy_uj(p["path"]) for p in pkgs]
+        wall = max(time.time() - t0, 1e-6)
+    else:
+        idle0 = int(prev.get("idle") or 0)
+        total0 = int(prev.get("total") or 0)
+        io0 = {k: tuple(v) for k, v in (prev.get("io") or {}).items()}
+        e0 = prev.get("energies") or []
+
+    dt = total1 - total0
+    di = idle1 - idle0
+    cpu_pct = 0.0 if dt <= 0 else max(0.0, min(100.0, (1.0 - di / dt) * 100.0))
     cpu_w = None
     source = "est"
-    if pkgs and wall > 0.05 and all(e is not None for e in energies):
+    if (
+        pkgs
+        and wall > 0.05
+        and len(e0) == len(e1)
+        and all(e is not None for e in list(e0) + list(e1))
+    ):
         uj = 0
-        ok = True
-        for p, a in zip(pkgs, energies):
-            b = rapl_energy_uj(p["path"])
-            if a is None or b is None:
-                ok = False
-                break
+        for p, a, b in zip(pkgs, e0, e1):
             delta = b - a
             if delta < 0:
                 rng = _read_int(os.path.join(p["path"], "max_energy_range_uj")) or 0
                 delta += rng
             uj += max(0, delta)
-        if ok:
-            cpu_w = round(uj / wall / 1_000_000.0, 1)
-            source = "rapl"
+        cpu_w = round(uj / wall / 1_000_000.0, 1)
+        source = "rapl"
     if cpu_w is None:
-        cpu_w = estimate_cpu_w(cpu_pct_m, tdp)
+        cpu_w = estimate_cpu_w(cpu_pct, tdp)
         source = "est"
     disks = estimate_disks_w(io0, io1)
+    _counters_save(idle1, total1, io1, e1, time.time())
     return {
-        "percent": cpu_pct_m,
+        "percent": cpu_pct,
         "cpu_w": cpu_w,
         "tdp_w": tdp,
         "cpu_source": source,
@@ -549,7 +818,8 @@ def snapshot() -> dict:
     if cpu_temp is None:
         cpu_temp = temp_c(hwmon_by_name("k10temp"))
     host = _read("/etc/hostname") or os.uname().nodename
-    g = gpu()
+    all_gpus = gpus()
+    g = all_gpus[0] if all_gpus else gpu()
     gpu_w = g.get("power_w")
     disk_w = sampled.get("disk_w")
     parts = [w for w in (sampled["cpu_w"], gpu_w, disk_w) if w is not None]
@@ -567,12 +837,17 @@ def snapshot() -> dict:
         "cpu": {
             "percent": round(cpu_pct, 1),
             "temp": cpu_temp,
-            "name": cpu_name(),
-            "cores": cpu_cores(),
+            "name": _cached("cpu_name", cpu_name),
+            "cores": _cached("cpu_cores", cpu_cores),
         },
         "mem": mem(),
+        "board": _cached("board", board_name),
+        "bios": _cached("bios", bios_meta),
+        "kernel": os.uname().release,
+        "uptime_s": uptime_s(),
         "disk": disk("/"),
         "gpu": g,
+        "gpus": all_gpus,
         "power": {
             "watts": round(sum(parts), 1) if parts else None,
             "cpu_w": sampled["cpu_w"],

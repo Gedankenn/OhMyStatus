@@ -97,13 +97,58 @@ function diskExtra(disk) {
   return used + "/" + total + " G"
 }
 
-function histPoints(arr) {
-  var out = []
-  if (!arr) return out
-  var n = arr.length
-  if (typeof n !== "number") return out
-  for (var i = 0; i < n; i++) out.push({ v: num(arr[i], 0) })
-  return out
+function ramKind(mem) {
+  var m = mem || {}
+  var kind = String(m.kind || "")
+  var mt = Number(m.mt_s)
+  if (kind && isFinite(mt) && mt > 0) return kind + "-" + Math.round(mt)
+  if (isFinite(mt) && mt > 0) return String(Math.round(mt))
+  return kind
+}
+
+function ramExtra(mem) {
+  var m = mem || {}
+  return (m.used_gb || 0) + "/" + (m.total_gb || 0) + " G"
+}
+
+function uptime(seconds) {
+  var n = Number(seconds)
+  if (!isFinite(n) || n <= 0) return ""
+  var d = Math.floor(n / 86400)
+  var h = Math.floor((n % 86400) / 3600)
+  var m = Math.floor((n % 3600) / 60)
+  if (d > 0) return d + "d " + h + "h"
+  if (h > 0) return h + "h " + m + "m"
+  return Math.max(1, m) + "m"
+}
+
+function biosLine(bios) {
+  var b = bios || {}
+  var version = trim(b.version)
+  var date = trim(b.date)
+  if (!version && !date) return ""
+  return "BIOS " + version + (date ? " · " + date : "")
+}
+
+function sysLine(snap) {
+  if (!snap) return ""
+  var bits = []
+  var kernel = trim(snap.kernel)
+  if (kernel) bits.push("kernel " + kernel)
+  var up = uptime(snap.uptime_s)
+  if (up) bits.push("up " + up)
+  return bits.join(" · ")
+}
+
+function hwLine(cpu, mem) {
+  var c = cpu || {}
+  var m = mem || {}
+  var bits = []
+  var threads = num(c.cores, 0)
+  if (threads > 0) bits.push(Math.round(threads) + " threads")
+  var total = num(m.total_gb, 0)
+  if (total > 0) bits.push(total + " GB RAM")
+  return bits.join(" · ")
 }
 
 function dockerList(snap) {
@@ -165,9 +210,14 @@ if (typeof module !== "undefined") {
     tempWatts: tempWatts,
     num: num,
     diskExtra: diskExtra,
+    ramExtra: ramExtra,
+    ramKind: ramKind,
+    uptime: uptime,
+    biosLine: biosLine,
+    sysLine: sysLine,
+    hwLine: hwLine,
     dockerDotColor: dockerDotColor,
     dockerList: dockerList,
-    histPoints: histPoints,
     stressed: stressed
   }
 }
