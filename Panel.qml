@@ -24,7 +24,7 @@ Panel {
   }
   readonly property string pollPy: pluginDir + "/poll.py"
   readonly property string pythonBin: "/usr/bin/python3"
-  readonly property real panelWidth: Style.space(360)
+  readonly property real panelWidth: Style.space(640)
 
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
@@ -72,6 +72,12 @@ Panel {
   property var vramHist: []
   property var diskHist: []
   property var pwrHist: []
+  property var cpuTempHist: []
+  property var memTempHist: []
+  property var gpuTempHist: []
+  property var vramTempHist: []
+  property var diskTempHist: []
+  property var diskTempItems: []
 
   function open() {
     openedFromHotkey = false
@@ -154,6 +160,43 @@ Panel {
     root.vramHist = h.vram || []
     root.diskHist = h.disk || []
     root.pwrHist = h.pwr || []
+    root.cpuTempHist = h.cpu_t || []
+    root.memTempHist = h.mem_t || []
+    root.gpuTempHist = h.gpu_t || []
+    root.vramTempHist = h.vram_t || []
+    var dt = h.disk_t || []
+    var ids = h.disk_ids || []
+    var series = []
+    if (dt.length && (typeof dt[0] === "number" || dt[0] === null)) series = [dt]
+    else series = dt
+    root.diskTempHist = series
+    var byId = {}
+    for (var s = 0; s < series.length; s++) {
+      var sid = (ids && ids.length > s) ? String(ids[s]) : ""
+      if (sid) byId[sid] = series[s]
+    }
+    var drives = (parsed.disk && parsed.disk.drives) ? parsed.disk.drives : []
+    var items = []
+    var n = (drives && typeof drives.length === "number") ? drives.length : 0
+    for (var i = 0; i < n; i++) {
+      var dr = drives[i] || {}
+      var id = String(dr.id || "")
+      items.push({
+        label: String(dr.model || id || "disk"),
+        id: id,
+        temp: dr.temp,
+        values: byId[id] || (series.length > i ? series[i] : [])
+      })
+    }
+    if (!items.length && series.length) {
+      items.push({
+        label: "DISK",
+        id: "disk",
+        temp: parsed.disk ? parsed.disk.temp : null,
+        values: series[0]
+      })
+    }
+    root.diskTempItems = items
   }
 
   function heatColor(pct, cool) {
@@ -325,6 +368,227 @@ Panel {
     }
   }
 
+  component LinePlot: Item {
+    id: plotBox
+    property var values: []
+    property real scaleMax: 100
+    property color accent: root.lime
+    property string unit: "%"
+    property string caption: ""
+
+    readonly property real lastValue: plotBox.lastFinite(plotBox.values)
+    readonly property int axisW: 26
+
+    function lastFinite(pts) {
+      var a = pts || []
+      for (var i = a.length - 1; i >= 0; i--) {
+        if (a[i] === null || a[i] === undefined || a[i] === "") continue
+        var n = Number(a[i])
+        if (isFinite(n)) return n
+      }
+      return 0
+    }
+
+    function capLabel(n, unit) {
+      var v = Number(n)
+      if (!isFinite(v)) v = 0
+      if (unit === "°") return Math.round(v) + "°"
+      if (unit === "W") return Math.round(v) + "W"
+      return Math.round(v) + unit
+    }
+
+    Rectangle {
+      anchors.fill: parent
+      radius: 3
+      color: Qt.rgba(plotBox.accent.r, plotBox.accent.g, plotBox.accent.b, 0.12)
+    }
+
+    AxisRail {
+      id: leftRail
+      anchors.left: parent.left
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.margins: 2
+      width: plotBox.axisW
+      accent: plotBox.accent
+      ratio: Math.max(0, Math.min(1, plotBox.lastValue / Math.max(plotBox.scaleMax, 1)))
+      topText: plotBox.capLabel(plotBox.scaleMax, plotBox.unit)
+      botText: plotBox.capLabel(0, plotBox.unit)
+      railOnLeft: true
+    }
+
+    Canvas {
+      id: plot
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.left: leftRail.right
+      anchors.right: parent.right
+      anchors.leftMargin: 3
+      anchors.rightMargin: 4
+      anchors.topMargin: 3
+      anchors.bottomMargin: 3
+
+      onWidthChanged: requestPaint()
+      onHeightChanged: requestPaint()
+      onVisibleChanged: if (visible) requestPaint()
+
+      Connections {
+        target: plotBox
+        function onValuesChanged() { plot.requestPaint() }
+        function onScaleMaxChanged() { plot.requestPaint() }
+        function onAccentChanged() { plot.requestPaint() }
+      }
+
+      onPaint: {
+        var ctx = getContext("2d")
+        var w = width
+        var h = height
+        ctx.clearRect(0, 0, w, h)
+        if (w < 2 || h < 2) return
+
+        var va = plotBox.accent
+        var stroke = "rgb(" + Math.round(va.r * 255) + ", " + Math.round(va.g * 255) + ", " + Math.round(va.b * 255) + ")"
+        var cap = Math.max(plotBox.scaleMax, 1)
+        var pts = plotBox.values || []
+        var n = pts.length
+        if (!n) return
+
+        ctx.strokeStyle = stroke
+        ctx.lineWidth = 1.9
+        ctx.lineJoin = "round"
+        ctx.lineCap = "round"
+        ctx.beginPath()
+        var started = false
+        for (var i = 0; i < n; i++) {
+          var raw = pts[i]
+          if (raw === null || raw === undefined || raw === "") { started = false; continue }
+          var v = Number(raw)
+          if (!isFinite(v)) { started = false; continue }
+          var x = n === 1 ? w * 0.5 : i * (w - 1) / (n - 1)
+          var y = h - 1 - (h - 2) * Math.max(0, Math.min(1, v / cap))
+          if (!started) { ctx.moveTo(x, y); started = true }
+          else ctx.lineTo(x, y)
+        }
+        ctx.stroke()
+      }
+    }
+
+    Text {
+      visible: plotBox.caption.length > 0
+      anchors.top: parent.top
+      anchors.right: parent.right
+      anchors.topMargin: 4
+      anchors.rightMargin: 6
+      text: plotBox.caption
+      color: Qt.rgba(plotBox.accent.r, plotBox.accent.g, plotBox.accent.b, 0.7)
+      font.family: root.contentFontFamily
+      font.pixelSize: 9
+      font.letterSpacing: 0.8
+      font.weight: Font.DemiBold
+    }
+  }
+
+  component DiskTempStack: Item {
+    id: stack
+    property var items: []
+
+    readonly property int count: (stack.items && typeof stack.items.length === "number") ? stack.items.length : 0
+
+    Repeater {
+      model: stack.count
+      delegate: Item {
+        required property int index
+        readonly property var item: stack.items[index] || ({})
+        width: stack.width
+        height: stack.count > 0 ? Math.floor((stack.height - Style.space(4) * (stack.count - 1)) / stack.count) : stack.height
+        y: index * (height + Style.space(4))
+
+        LinePlot {
+          anchors.left: parent.left
+          anchors.right: nowLabel.left
+          anchors.rightMargin: Style.space(6)
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          values: parent.item.values || []
+          scaleMax: 110
+          accent: root.tempColor(parent.item.temp)
+          unit: "°"
+          caption: String(parent.item.label || "")
+        }
+        Text {
+          id: nowLabel
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          width: 40
+          textFormat: Text.PlainText
+          text: Model.deg(parent.item.temp)
+          color: root.tempColor(parent.item.temp)
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.body
+          font.weight: Font.Bold
+          horizontalAlignment: Text.AlignRight
+        }
+      }
+    }
+  }
+
+  component AxisRail: Item {
+    id: rail
+    property color accent: root.lime
+    property real ratio: 0
+    property string topText: ""
+    property string botText: ""
+    property bool railOnLeft: true
+
+    Rectangle {
+      id: track
+      width: 3
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.left: rail.railOnLeft ? parent.left : undefined
+      anchors.right: rail.railOnLeft ? undefined : parent.right
+      radius: width / 2
+      color: Qt.rgba(rail.accent.r, rail.accent.g, rail.accent.b, 0.22)
+
+      Rectangle {
+        width: parent.width
+        height: Math.max(parent.width, parent.height * Math.max(0, Math.min(1, rail.ratio)))
+        anchors.left: parent.left
+        anchors.bottom: parent.bottom
+        radius: width / 2
+        color: rail.accent
+      }
+    }
+
+    Text {
+      anchors.top: parent.top
+      anchors.left: rail.railOnLeft ? track.right : parent.left
+      anchors.right: rail.railOnLeft ? parent.right : track.left
+      anchors.leftMargin: rail.railOnLeft ? 3 : 0
+      anchors.rightMargin: rail.railOnLeft ? 0 : 3
+      text: rail.topText
+      color: rail.accent
+      font.family: root.contentFontFamily
+      font.pixelSize: 9
+      font.weight: Font.DemiBold
+      horizontalAlignment: rail.railOnLeft ? Text.AlignLeft : Text.AlignRight
+      elide: Text.ElideRight
+    }
+    Text {
+      anchors.bottom: parent.bottom
+      anchors.left: rail.railOnLeft ? track.right : parent.left
+      anchors.right: rail.railOnLeft ? parent.right : track.left
+      anchors.leftMargin: rail.railOnLeft ? 3 : 0
+      anchors.rightMargin: rail.railOnLeft ? 0 : 3
+      text: rail.botText
+      color: Qt.rgba(rail.accent.r, rail.accent.g, rail.accent.b, 0.7)
+      font.family: root.contentFontFamily
+      font.pixelSize: 9
+      horizontalAlignment: rail.railOnLeft ? Text.AlignLeft : Text.AlignRight
+      elide: Text.ElideRight
+    }
+  }
+
   component HistRow: Item {
     id: hrow
     property string name: ""
@@ -334,8 +598,28 @@ Panel {
     property color accent: root.lime
     property color extraColor: root.lime
     property var values: []
+    property var temps: []
+    property var diskTemps: []
     property real scaleMax: 100
-    property real chartH: Style.space(44)
+    property real tempScaleMax: 110
+    property color tempAccent: root.hot
+    property string valueUnit: "%"
+    property real chartH: Style.space(56)
+
+    readonly property bool showDiskTemps: {
+      var items = hrow.diskTemps || []
+      return !!(items && typeof items.length === "number" && items.length > 0)
+    }
+    readonly property bool showTemp: {
+      if (hrow.showDiskTemps) return true
+      var pts = hrow.temps || []
+      for (var i = 0; i < pts.length; i++) {
+        var raw = pts[i]
+        if (raw === null || raw === undefined || raw === "") continue
+        if (isFinite(Number(raw))) return true
+      }
+      return false
+    }
 
     width: parent ? parent.width : 0
     height: hcol.implicitHeight
@@ -403,61 +687,40 @@ Panel {
       }
 
       Item {
-        id: chart
         width: parent.width
         height: hrow.chartH
 
-        Rectangle {
-          anchors.fill: parent
-          radius: 3
-          color: Qt.rgba(hrow.accent.r, hrow.accent.g, hrow.accent.b, 0.14)
+        LinePlot {
+          id: usagePlot
+          anchors.left: parent.left
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          width: hrow.showTemp ? Math.floor((parent.width - Style.space(8)) / 2) : parent.width
+          values: hrow.values
+          scaleMax: hrow.scaleMax
+          accent: hrow.accent
+          unit: hrow.valueUnit
         }
-
-        Canvas {
-          id: plot
-          anchors.fill: parent
-          anchors.margins: 2
-
-          function paintLine() { requestPaint() }
-
-          onWidthChanged: paintLine()
-          onHeightChanged: paintLine()
-          onVisibleChanged: if (visible) paintLine()
-
-          Connections {
-            target: hrow
-            function onValuesChanged() { plot.paintLine() }
-            function onScaleMaxChanged() { plot.paintLine() }
-            function onAccentChanged() { plot.paintLine() }
-          }
-
-          onPaint: {
-            var ctx = getContext("2d")
-            var w = width
-            var h = height
-            ctx.clearRect(0, 0, w, h)
-            var pts = hrow.values || []
-            var n = pts.length
-            if (!n || w < 2 || h < 2) return
-            var cap = Math.max(hrow.scaleMax, 1)
-            var c = hrow.accent
-            var stroke = "rgb(" + Math.round(c.r * 255) + ", " + Math.round(c.g * 255) + ", " + Math.round(c.b * 255) + ")"
-            ctx.strokeStyle = stroke
-            ctx.fillStyle = "rgba(" + Math.round(c.r * 255) + ", " + Math.round(c.g * 255) + ", " + Math.round(c.b * 255) + ", 0.18)"
-            ctx.lineWidth = 1.8
-            ctx.lineJoin = "round"
-            ctx.lineCap = "round"
-            ctx.beginPath()
-            for (var i = 0; i < n; i++) {
-              var v = Number(pts[i])
-              if (!isFinite(v)) v = 0
-              var x = n === 1 ? w * 0.5 : i * (w - 1) / (n - 1)
-              var y = h - 1 - (h - 2) * Math.max(0, Math.min(1, v / cap))
-              if (i === 0) ctx.moveTo(x, y)
-              else ctx.lineTo(x, y)
-            }
-            ctx.stroke()
-          }
+        LinePlot {
+          id: tempPlot
+          visible: hrow.showTemp && !hrow.showDiskTemps
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          width: (hrow.showTemp && !hrow.showDiskTemps) ? Math.floor((parent.width - Style.space(8)) / 2) : 0
+          values: hrow.temps
+          scaleMax: hrow.tempScaleMax
+          accent: hrow.tempAccent
+          unit: "°"
+          caption: "TEMP"
+        }
+        DiskTempStack {
+          visible: hrow.showDiskTemps
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          width: hrow.showDiskTemps ? Math.floor((parent.width - Style.space(8)) / 2) : 0
+          items: hrow.diskTemps
         }
       }
     }
@@ -549,9 +812,11 @@ Panel {
               value: Model.pct(root.cpu.percent)
               extra: Model.tempWatts(root.cpu.temp, root.power.cpu_w, root.power.cpu_source !== "rapl")
               values: root.cpuHist
+              temps: root.cpuTempHist
               scaleMax: 100
               accent: root.heatColor(root.cpu.percent, root.cpuCool)
               extraColor: root.tempColor(root.cpu.temp)
+              tempAccent: root.tempColor(root.cpu.temp)
             }
             HistRow {
               name: "RAM"
@@ -559,9 +824,11 @@ Panel {
               value: Model.pct(root.mem.percent)
               extra: Model.ramExtra(root.mem)
               values: root.memHist
+              temps: root.memTempHist
               scaleMax: 100
               accent: root.heatColor(root.mem.percent, root.ramCool)
-              extraColor: root.heatColor(root.mem.percent, root.ramCool)
+              extraColor: root.tempColor(root.mem.temp)
+              tempAccent: root.tempColor(root.mem.temp)
             }
             Repeater {
               model: root.gpus.length
@@ -580,18 +847,28 @@ Panel {
                   value: Model.pct(gpuBlock.card.percent)
                   extra: Model.tempWatts(gpuBlock.card.temp, gpuBlock.card.power_w, false)
                   values: root.gpuHist.length > gpuBlock.index ? root.gpuHist[gpuBlock.index] : []
+                  temps: root.gpuTempHist.length > gpuBlock.index ? root.gpuTempHist[gpuBlock.index] : []
                   scaleMax: 100
                   accent: root.heatColor(gpuBlock.card.percent, root.gpuCool)
                   extraColor: root.tempColor(gpuBlock.card.temp)
+                  tempAccent: root.tempColor(gpuBlock.card.temp)
                 }
                 HistRow {
                   name: "VRAM"
                   value: Model.pct(gpuBlock.card.vram_percent)
-                  extra: (gpuBlock.card.vram_used_mb || 0) + "/" + (gpuBlock.card.vram_total_mb || 0) + " M"
+                  extra: {
+                    var base = (gpuBlock.card.vram_used_mb || 0) + "/" + (gpuBlock.card.vram_total_mb || 0) + " M"
+                    var t = Model.deg(gpuBlock.card.temp_mem)
+                    return t === "—" ? base : base + " · " + t
+                  }
                   values: root.vramHist.length > gpuBlock.index ? root.vramHist[gpuBlock.index] : []
+                  temps: root.vramTempHist.length > gpuBlock.index ? root.vramTempHist[gpuBlock.index] : []
                   scaleMax: 100
                   accent: root.heatColor(gpuBlock.card.vram_percent, root.vramCool)
-                  extraColor: root.heatColor(gpuBlock.card.vram_percent, root.vramCool)
+                  extraColor: gpuBlock.card.temp_mem !== undefined && gpuBlock.card.temp_mem !== null && gpuBlock.card.temp_mem !== ""
+                    ? root.tempColor(gpuBlock.card.temp_mem)
+                    : root.heatColor(gpuBlock.card.vram_percent, root.vramCool)
+                  tempAccent: root.tempColor(gpuBlock.card.temp_mem)
                 }
               }
             }
@@ -600,9 +877,12 @@ Panel {
               value: Model.pct(root.disk.percent)
               extra: Model.diskExtra(root.disk)
               values: root.diskHist
+              diskTemps: root.diskTempItems
               scaleMax: 100
               accent: root.heatColor(root.disk.percent, root.diskCool)
-              extraColor: root.heatColor(root.disk.percent, root.diskCool)
+              extraColor: root.tempColor(root.disk.temp)
+              tempAccent: root.tempColor(root.disk.temp)
+              chartH: Style.space(Math.max(56, 40 * Math.max(1, root.diskTempItems.length)))
             }
             HistRow {
               visible: root.power.watts !== undefined && root.power.watts !== null && root.power.watts !== ""
@@ -613,7 +893,7 @@ Panel {
               scaleMax: Math.max(Model.num(root.power.cap_w, 0), 1)
               accent: root.heatColor(root.powerPct, root.powerCool)
               extraColor: root.powerCool
-              chartH: Style.space(56)
+              valueUnit: "W"
             }
           }
 

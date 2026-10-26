@@ -90,11 +90,26 @@ function diskExtra(disk) {
   var d = disk || {}
   var used = num(d.used_gb)
   var total = num(d.total_gb)
+  var base
   if (total >= 1000) {
     var usedStr = used >= 1000 ? (used / 1024).toFixed(1) + " T" : Math.round(used) + " G"
-    return usedStr + " / " + (total / 1024).toFixed(1) + " T"
+    base = usedStr + " / " + (total / 1024).toFixed(1) + " T"
+  } else {
+    base = used + "/" + total + " G"
   }
-  return used + "/" + total + " G"
+  var drives = d.drives
+  if (drives && typeof drives.length === "number" && drives.length > 0) {
+    var bits = []
+    for (var i = 0; i < drives.length; i++) {
+      var dr = drives[i] || {}
+      var t = deg(dr.temp)
+      if (t === "—") continue
+      bits.push(t)
+    }
+    if (bits.length) return base + " · " + bits.join(" · ")
+  }
+  var t = deg(d.temp)
+  return t === "—" ? base : base + " · " + t
 }
 
 function ramKind(mem) {
@@ -108,7 +123,9 @@ function ramKind(mem) {
 
 function ramExtra(mem) {
   var m = mem || {}
-  return (m.used_gb || 0) + "/" + (m.total_gb || 0) + " G"
+  var base = (m.used_gb || 0) + "/" + (m.total_gb || 0) + " G"
+  var t = deg(m.temp)
+  return t === "—" ? base : base + " · " + t
 }
 
 function uptime(seconds) {

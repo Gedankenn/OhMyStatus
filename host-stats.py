@@ -292,6 +292,7 @@ def mem() -> dict:
         "total_gb": round(total / 1048576.0, 1),
         "kind": kind,
         "mt_s": mt_s,
+        "temp": dimm_temp(),
     }
 
 
@@ -380,6 +381,8 @@ def disk(_path: str = "/") -> dict:
         used = max(0, total - st.f_frsize * st.f_bavail)
         names, mounts = ["root"], ["/"]
     pct = (used / total * 100.0) if total else 0.0
+    drives = disk_drives()
+    temps = [d["temp"] for d in drives if d.get("temp") is not None]
     return {
         "percent": round(pct, 1),
         "used_gb": round(used / 1073741824.0, 1),
@@ -387,6 +390,8 @@ def disk(_path: str = "/") -> dict:
         "path": "+".join(mounts) if mounts else "/",
         "disks": len(names),
         "mounts": mounts,
+        "temp": max(temps) if temps else None,
+        "drives": drives,
     }
 
 
@@ -410,6 +415,84 @@ def temp_c(hwmon: str | None, sensor: str = "temp1_input") -> int | None:
     if raw is None:
         return None
     return int(raw / 1000)
+
+
+def hwmon_labeled_temps(hw: str | None) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not hw:
+        return out
+    for path in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+        label = _read(path.replace("_input", "_label")).lower() or "temp"
+        raw = _read_int_retry(path)
+        if raw is None:
+            continue
+        out[label] = int(raw / 1000)
+    return out
+
+
+def _sane_temp(v: int | None, lo: int = 1, hi: int = 125) -> int | None:
+    if v is None or v < lo or v > hi:
+        return None
+    return v
+
+
+def dimm_temp() -> int | None:
+    temps: list[int] = []
+    for base in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if _read(os.path.join(base, "name")) != "jc42":
+            continue
+        t = _sane_temp(temp_c(base), 5, 95)
+        if t is not None:
+            temps.append(t)
+    return max(temps) if temps else None
+
+
+def _disk_hwmon_temps() -> dict[str, int]:
+    """hwmon device realpath -> Composite/temp1 °C for nvme and drivetemp."""
+    out: dict[str, int] = {}
+    for base in sorted(glob.glob("/sys/class/hwmon/hwmon[0-9]*")):
+        name = _read(os.path.join(base, "name"))
+        if name not in ("nvme", "drivetemp"):
+            continue
+        t = _sane_temp(temp_c(base), 1, 120)
+        if t is None:
+            continue
+        out[os.path.realpath(os.path.join(base, "device"))] = t
+    return out
+
+
+def disk_drives() -> list[dict]:
+    """Physical disks with current temp. Skip empty card readers / 0-size nodes."""
+    hwmap = _disk_hwmon_temps()
+    drives: list[dict] = []
+    try:
+        blocks = os.listdir("/sys/block")
+    except OSError:
+        return []
+    for name in sorted(blocks):
+        if name.startswith(("loop", "ram", "zram", "sr", "md", "dm-")):
+            continue
+        base = os.path.join("/sys/block", name)
+        sectors = _read_int(os.path.join(base, "size")) or 0
+        if sectors <= 0:
+            continue
+        model = " ".join(_read(os.path.join(base, "device", "model")).split())
+        if not model:
+            model = name
+        dev = os.path.realpath(os.path.join(base, "device"))
+        temp = hwmap.get(dev)
+        if temp is None:
+            for hwdev, t in hwmap.items():
+                if dev.startswith(hwdev + os.sep) or hwdev.startswith(dev + os.sep):
+                    temp = t
+                    break
+        drives.append({"id": name, "model": model[:48], "temp": temp})
+    return drives
+
+
+def disk_temp() -> int | None:
+    temps = [d["temp"] for d in disk_drives() if d.get("temp") is not None]
+    return max(temps) if temps else None
 
 
 def _uw_to_w(raw: int | None) -> float | None:
@@ -594,10 +677,20 @@ def gpu_list() -> list[dict]:
             if not hw:
                 hw = hwmon_by_name("amdgpu")
             gpu_w, gpu_cap = _hwmon_power_w(hw)
+            labeled = hwmon_labeled_temps(hw)
+            edge = labeled.get("edge")
+            junc = labeled.get("junction") or labeled.get("hotspot")
+            memt = labeled.get("mem") or labeled.get("memory")
+            if junc is None and edge is None:
+                first = next(iter(labeled.values()), None)
+                edge = first
             found.append(
                 {
                     "percent": int(max(0, min(100, busy))),
-                    "temp": temp_c(hw),
+                    "temp": junc if junc is not None else edge,
+                    "temp_edge": edge,
+                    "temp_junc": junc,
+                    "temp_mem": memt,
                     "name": pretty or label or "gpu",
                     "vram_percent": round(vram_pct, 1),
                     "vram_used_mb": int(used / 1048576) if used else 0,
@@ -625,6 +718,9 @@ def gpu() -> dict:
     return {
         "percent": 0,
         "temp": None,
+        "temp_edge": None,
+        "temp_junc": None,
+        "temp_mem": None,
         "name": "",
         "vram_percent": 0,
         "vram_used_mb": 0,
