@@ -5,7 +5,7 @@ side-by-side line charts: usage next to temperature for CPU, RAM, GPU and VRAM,
 plus power. Disk shows used space and the current temperature of each drive.
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="OhMyStatus popup: usage charts beside temperature charts" width="480">
+  <img src="assets/screenshot.png" alt="OhMyStatus popup: usage charts beside temperature charts" width="900">
 </p>
 
 ## Install
