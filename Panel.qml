@@ -377,7 +377,8 @@ Panel {
     property string caption: ""
 
     readonly property real lastValue: plotBox.lastFinite(plotBox.values)
-    readonly property int axisW: 26
+    readonly property real drawMax: plotBox.ceilingFor(plotBox.values, plotBox.scaleMax, plotBox.unit)
+    readonly property int axisW: 34
 
     function lastFinite(pts) {
       var a = pts || []
@@ -389,12 +390,101 @@ Panel {
       return 0
     }
 
+    function maxOf(pts) {
+      var m = 0
+      var a = pts || []
+      for (var i = 0; i < a.length; i++) {
+        if (a[i] === null || a[i] === undefined || a[i] === "") continue
+        var n = Number(a[i])
+        if (isFinite(n) && n > m) m = n
+      }
+      return m
+    }
+
+    function ceilingFor(pts, scaleMax, unit) {
+      var cap = Math.max(Number(scaleMax) || 0, 1)
+      var peak = plotBox.maxOf(pts)
+      if (unit === "%") return Math.max(cap, peak)
+      if (peak <= cap) return cap
+      if (unit === "°") return Math.ceil(peak / 5) * 5
+      return Math.ceil(peak)
+    }
+
     function capLabel(n, unit) {
       var v = Number(n)
       if (!isFinite(v)) v = 0
       if (unit === "°") return Math.round(v) + "°"
       if (unit === "W") return Math.round(v) + "W"
       return Math.round(v) + unit
+    }
+
+    function peaksFor(pts, cap, w, h) {
+      var a = pts || []
+      var n = a.length
+      if (!n || w < 8 || h < 8) return []
+      var xs = []
+      var i
+      for (i = 0; i < n; i++) {
+        var raw = a[i]
+        if (raw === null || raw === undefined || raw === "") continue
+        var v = Number(raw)
+        if (!isFinite(v)) continue
+        xs.push({ i: i, v: v })
+      }
+      if (!xs.length) return []
+
+      var gMax = xs[0]
+      var gMin = xs[0]
+      for (i = 1; i < xs.length; i++) {
+        if (xs[i].v > gMax.v) gMax = xs[i]
+        if (xs[i].v < gMin.v) gMin = xs[i]
+      }
+      if (gMax.v <= 0) return []
+
+      var cands = []
+      var span = gMax.v - gMin.v
+      if (xs.length === 1 || span < cap * 0.10) {
+        var first = -1
+        var last = 0
+        for (i = 0; i < xs.length; i++) {
+          if (xs[i].v < gMax.v) continue
+          if (first < 0) first = i
+          last = i
+        }
+        var mid = first < 0 ? Math.floor(xs.length / 2) : Math.floor((first + last) / 2)
+        cands.push({ i: xs[mid].i, v: gMax.v })
+      } else {
+        var riseMin = Math.max(cap * 0.05, span * 0.12)
+        for (i = 0; i < xs.length; i++) {
+          var prev = i > 0 ? xs[i - 1].v : xs[i].v
+          var cur = xs[i].v
+          var next = i + 1 < xs.length ? xs[i + 1].v : xs[i].v
+          if (cur > prev && cur >= next && (cur - prev) >= riseMin)
+            cands.push(xs[i])
+        }
+        var hasMax = false
+        for (i = 0; i < cands.length; i++) {
+          if (cands[i].i === gMax.i) { hasMax = true; break }
+        }
+        if (!hasMax) cands.push(gMax)
+      }
+
+      cands.sort(function (a, b) { return b.v - a.v })
+
+      var out = []
+      var minDx = Math.max(40, w * 0.18)
+      for (i = 0; i < cands.length && out.length < 4; i++) {
+        var p = cands[i]
+        var x = n === 1 ? w * 0.5 : p.i * (w - 1) / (n - 1)
+        var clash = false
+        for (var k = 0; k < out.length; k++) {
+          if (Math.abs(x - out[k].x) < minDx) { clash = true; break }
+        }
+        if (clash) continue
+        var y = h - 1 - (h - 2) * Math.max(0, Math.min(1, p.v / cap))
+        out.push({ x: x, y: y, v: p.v })
+      }
+      return out
     }
 
     Rectangle {
@@ -411,8 +501,8 @@ Panel {
       anchors.margins: 2
       width: plotBox.axisW
       accent: plotBox.accent
-      ratio: Math.max(0, Math.min(1, plotBox.lastValue / Math.max(plotBox.scaleMax, 1)))
-      topText: plotBox.capLabel(plotBox.scaleMax, plotBox.unit)
+      ratio: Math.max(0, Math.min(1, plotBox.lastValue / Math.max(plotBox.drawMax, 1)))
+      topText: String(Math.round(Math.max(plotBox.drawMax, 0)))
       botText: plotBox.capLabel(0, plotBox.unit)
       railOnLeft: true
     }
@@ -436,6 +526,7 @@ Panel {
         target: plotBox
         function onValuesChanged() { plot.requestPaint() }
         function onScaleMaxChanged() { plot.requestPaint() }
+        function onDrawMaxChanged() { plot.requestPaint() }
         function onAccentChanged() { plot.requestPaint() }
       }
 
@@ -448,7 +539,7 @@ Panel {
 
         var va = plotBox.accent
         var stroke = "rgb(" + Math.round(va.r * 255) + ", " + Math.round(va.g * 255) + ", " + Math.round(va.b * 255) + ")"
-        var cap = Math.max(plotBox.scaleMax, 1)
+        var cap = Math.max(plotBox.drawMax, 1)
         var pts = plotBox.values || []
         var n = pts.length
         if (!n) return
@@ -470,6 +561,43 @@ Panel {
           else ctx.lineTo(x, y)
         }
         ctx.stroke()
+
+        var peaks = plotBox.peaksFor(pts, cap, w, h)
+        if (!peaks.length) return
+
+        var fam = String(root.contentFontFamily || "sans-serif").replace(/"/g, "")
+        ctx.font = "700 9px \"" + fam + "\""
+        ctx.textBaseline = "alphabetic"
+        ctx.textAlign = "left"
+
+        var pi
+        for (pi = 0; pi < peaks.length; pi++) {
+          var pk = peaks[pi]
+          ctx.beginPath()
+          ctx.fillStyle = stroke
+          ctx.arc(pk.x, pk.y, 2.1, 0, Math.PI * 2)
+          ctx.fill()
+        }
+
+        for (pi = 0; pi < peaks.length; pi++) {
+          pk = peaks[pi]
+          var label = plotBox.capLabel(pk.v, plotBox.unit)
+          var tw = ctx.measureText(label).width
+          var lx = pk.x - tw / 2
+          if (lx < 1) lx = 1
+          if (lx + tw > w - 1) lx = Math.max(1, w - 1 - tw)
+          var ly = pk.y - 6
+          if (ly < 10) ly = pk.y + 12
+          if (plotBox.caption.length > 0 && pk.x > w * 0.62 && pk.y < 18 && ly < 12)
+            ly = pk.y + 12
+
+          var padX = 2.5
+          var padY = 2
+          ctx.fillStyle = "rgba(8, 10, 8, 0.72)"
+          ctx.fillRect(lx - padX, ly - 8 - padY, tw + padX * 2, 10 + padY * 2)
+          ctx.fillStyle = stroke
+          ctx.fillText(label, lx, ly)
+        }
       }
     }
 
@@ -572,7 +700,7 @@ Panel {
       font.pixelSize: 9
       font.weight: Font.DemiBold
       horizontalAlignment: rail.railOnLeft ? Text.AlignLeft : Text.AlignRight
-      elide: Text.ElideRight
+      wrapMode: Text.NoWrap
     }
     Text {
       anchors.bottom: parent.bottom
